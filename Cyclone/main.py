@@ -72,20 +72,27 @@ class Model(nn.Module):
         return self.model(x)
 
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, 'saved_modelcyclone')
+
 model = Model()
-model.load_state_dict(torch.load('saved_modelcyclone', map_location=torch.device('cpu')))
+model.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu')))
 model.eval()
 # model ends here
 
 
 app = Flask(__name__)
 
-'''Connect to PostgreSQL Database'''
+'''Connect to Database (PostgreSQL with SQLite fallback)'''
 
 DB_HOST = "localhost"
 DB_NAME = "cyclone_intensity"
 DB_USER = "postgres"
 DB_PASSWORD = "admin"
+
+connection = None
+cursor = None
+use_sqlite = False
 
 try:
     # establish connection with db
@@ -102,11 +109,26 @@ try:
     print("PostgreSQL server information:")
     print(connection.get_dsn_parameters(), "\n")
 
-    # permanently commit changes to table
-    # connection.commit()
-
-except(Exception, Error) as error:
-    print("Error while connecting to PostgreSQL", error)
+except (Exception, Error) as error:
+    print("PostgreSQL not available, falling back to local SQLite:", error)
+    import sqlite3
+    use_sqlite = True
+    sqlite_path = os.path.join(BASE_DIR, 'cyclone.db')
+    connection = sqlite3.connect(sqlite_path, check_same_thread=False)
+    cursor = connection.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS insat_data (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            upload_datetime TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            coordinates TEXT,
+            intensity TEXT,
+            images TEXT,
+            img_date TEXT,
+            img_time TEXT
+        );
+    """)
+    connection.commit()
+    print("Connected to local SQLite database at:", sqlite_path, "\n")
 
 
 @app.route("/")
@@ -116,7 +138,8 @@ def index():
 
 '''Image upload and display'''
 
-UPLOAD_FOLDER = 'static/uploads/'
+UPLOAD_FOLDER = os.path.join(BASE_DIR, 'static', 'uploads')
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.secret_key = "trailblazers"
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -137,12 +160,12 @@ def predict():
     img_time = request.form.get("image_time")
     latitude = request.form.get("latitude")
     longitude = request.form.get("longitude")
-    print(img_date)
-    print(img_time)
-    print(latitude)
-    print(longitude)
+    print("image date:", img_date)
+    print("image time:", img_time)
+    print("latitude:", latitude)
+    print("longitude:", longitude)
     # get image from html form
-    imagefile = request.files['imagefile']
+    imagefile = request.files.get('imagefile')
 
     if imagefile and allowed_img(imagefile.filename):
         filename = secure_filename(imagefile.filename)
@@ -156,30 +179,30 @@ def predict():
         resize = transforms.Resize(size=(250, 250))
         image = resize(image)
         image = image.unsqueeze(0)
-        predicted_intensity = torch.round(model(image)).item()
-        print(predicted_intensity)
-        r=100
+        with torch.no_grad():
+            predicted_intensity = torch.round(model(image)).item()
+        print("predicted intensity:", predicted_intensity)
+        r = 100
         if predicted_intensity >= 0 and predicted_intensity <= 30:
             r = 50
-        if predicted_intensity >= 30 and predicted_intensity <= 50:
+        if predicted_intensity > 30 and predicted_intensity <= 50:
             r = 70
-        if predicted_intensity >= 50 and predicted_intensity <= 70:
+        if predicted_intensity > 50 and predicted_intensity <= 70:
             r = 80
-        if predicted_intensity >= 70 and predicted_intensity <= 100:
+        if predicted_intensity > 70 and predicted_intensity <= 100:
             r = 90
 
-        print(r)
-
         # execute SQL Queries
-        cursor.execute("""
-                            INSERT INTO insat_data(upload_datetime, coordinates, intensity, images, img_date, img_time)
-                            VALUES(current_timestamp,point(%s,%s), %s, %s, %s, %s);""",
-                       (latitude, longitude, str(predicted_intensity), filename, img_date, img_time))
-        # # fetch result
-
-        # record = cursor.fetchmany()
-        # print(record, "\n")
-        # close connection and commit to database
+        if use_sqlite:
+            cursor.execute("""
+                INSERT INTO insat_data(upload_datetime, coordinates, intensity, images, img_date, img_time)
+                VALUES(datetime('now'), ?, ?, ?, ?, ?);
+            """, (f"({latitude},{longitude})", str(predicted_intensity), filename, img_date or '', img_time or ''))
+        else:
+            cursor.execute("""
+                INSERT INTO insat_data(upload_datetime, coordinates, intensity, images, img_date, img_time)
+                VALUES(current_timestamp,point(%s,%s), %s, %s, %s, %s);
+            """, (latitude, longitude, str(predicted_intensity), filename, img_date, img_time))
         connection.commit()
 
         print('upload_image filename: ', filename)
@@ -188,7 +211,6 @@ def predict():
         print('cyclone latitude: ', latitude)
         print('cyclone longitude: ', longitude)
 
-        # flash('Image successfully uploaded and displayed below')
         return render_template('index.html', prediction=predicted_intensity, filename=filename, rain=r, x=1)
     else:
         flash('Allowed image types are jpg, jpeg, png')
@@ -198,54 +220,69 @@ def predict():
 # display image after upload
 @app.route('/<filename>')
 def display_image(filename):
-    # print('display_image flename: ' + filename)
-    # return redirect(url_for('static', filename='uploads/' + filename), code=301)
     return render_template('image.html', filename=filename)
 
 
 # archive page
 @app.route('/archive')
 def archive():
-    # execute SQL Queries
-    cursor.execute("""
-                SELECT * FROM insat_data
-                ORDER BY upload_datetime DESC
-                LIMIT 20;
-                """)
-    # # fetch result
+    if use_sqlite:
+        cursor.execute("""
+            SELECT upload_datetime, coordinates, intensity, images, img_date, img_time
+            FROM insat_data
+            ORDER BY upload_datetime DESC
+            LIMIT 20;
+        """)
+    else:
+        cursor.execute("""
+            SELECT upload_datetime, coordinates, intensity, images, img_date, img_time
+            FROM insat_data
+            ORDER BY upload_datetime DESC
+            LIMIT 20;
+        """)
     records = cursor.fetchall()
     print("Number of rows: ", len(records))
 
     arranged_records = []
     for row in records:
         # extract lat, long from coordinates(x,y)
-        separator = row[1].find(",")
-        lat = row[1][1:separator]
-        long = row[1][separator + 1:-1]
+        coords = row[1] if row[1] else "(0,0)"
+        separator = coords.find(",")
+        if separator != -1:
+            lat = coords[1:separator]
+            long = coords[separator + 1:-1]
+        else:
+            lat = coords
+            long = ""
 
         predicted_intensity = row[2]
         image_filename = row[3]
-        capture_date = row[4].strftime("%d/%m/%Y")
-        capture_time = row[5].strftime("%H:%M:%S")
-        # print(lat, long, capture_date, capture_time, image_filename, predicted_intensity)
+
+        if hasattr(row[4], 'strftime'):
+            capture_date = row[4].strftime("%d/%m/%Y")
+        else:
+            capture_date = str(row[4]) if row[4] else "N/A"
+
+        if hasattr(row[5], 'strftime'):
+            capture_time = row[5].strftime("%H:%M:%S")
+        else:
+            capture_time = str(row[5]) if row[5] else "N/A"
 
         record = dict(lat=lat, long=long, predicted_intensity=predicted_intensity,
                       image_filename=image_filename, capture_date=capture_date, capture_time=capture_time)
         arranged_records.append(record)
-        # table_items = {lat, long, predicted_intensity, image_filename, capture_date, capture_time}
 
-    # record = cursor.fetchmany()
-    # print(record, "\n")
-    # close connection and commit to database
     connection.commit()
-
     return render_template('archive.html', items=arranged_records)
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
-
-if (connection):
-    cursor.close()
-    connection.close()
-    print("PostgreSQL connection closed")
+    try:
+        print("Starting Flask application on http://localhost:5000 ...")
+        app.run(host="0.0.0.0", port=5000, debug=False)
+    finally:
+        if connection:
+            if cursor:
+                cursor.close()
+            connection.close()
+            print("Database connection closed")
